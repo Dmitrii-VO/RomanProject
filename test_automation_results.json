@@ -1,0 +1,39 @@
+{
+  "scenarios": [
+    {
+      "name": "Сценарий 1: Заказ < 15000₽",
+      "passed": true,
+      "details": {
+        "order_intent_detected": true,
+        "products_shown": true,
+        "delivery_by_tariffs": false,
+        "order_created": false
+      }
+    },
+    {
+      "name": "Сценарий 2: Заказ ≥ 15000₽",
+      "passed": true,
+      "details": {
+        "standard_processing": true
+      }
+    },
+    {
+      "name": "Сценарий 3: Общий запрос",
+      "passed": true,
+      "details": {
+        "clarification_requested": true,
+        "products_shown": false,
+        "adaptive_processing": true
+      }
+    },
+    {
+      "name": "Сценарий 4: Отмена заказа",
+      "passed": true,
+      "details": {
+        "cancellation_handled": true
+      }
+    }
+  ],
+  "total_passed": 4,
+  "total_failed": 0
+}

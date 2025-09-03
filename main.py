@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 from utils.logger import app_logger
 from src.bot.telegram_client import AmberTelegramClient
-from src.ai.consultant import AmberAIConsultant
+from src.ai.consultant_v2 import AmberAIConsultantV2
 
 
 async def main():
@@ -26,8 +26,8 @@ async def main():
     # Создание компонентов системы
     app_logger.info("Инициализация компонентов...")
     
-    # ИИ консультант
-    ai_consultant = AmberAIConsultant()
+    # ИИ консультант v2 с полной автоматизацией
+    ai_consultant = AmberAIConsultantV2()
     
     # Telegram клиент
     telegram_client = AmberTelegramClient(api_id, api_hash)
@@ -38,7 +38,8 @@ async def main():
         await telegram_client.start_client()
         
         # Обработка сообщений
-        @telegram_client.client.on(telegram_client.client.events.NewMessage)
+        from telethon import events
+        @telegram_client.client.on(events.NewMessage)
         async def handle_new_message(event):
             """Обработчик новых сообщений"""
             try:
@@ -49,26 +50,20 @@ async def main():
                 from utils.logger import log_conversation
                 log_conversation(user_id, "user_message", message_text)
                 
-                # Обработка сообщения через ИИ
-                ai_response = await ai_consultant.process_message(message_text)
+                # Обработка сообщения через ИИ с передачей user_id для контекста
+                ai_response = await ai_consultant.process_message(user_id, message_text)
                 
-                # Проверка необходимости эскалации
-                if ai_consultant.should_escalate(message_text, ai_response):
-                    escalation_message = ("🔄 Ваш запрос передан нашему менеджеру. "
-                                         "Он свяжется с вами в ближайшее время.")
-                    await telegram_client.send_message(user_id, escalation_message)
-                    
-                    # TODO: Отправить уведомление менеджеру
-                    app_logger.info(f"Эскалация для пользователя {user_id}")
-                else:
-                    # Отправка ответа ИИ
-                    await telegram_client.send_message(user_id, ai_response)
+                # Отправка ответа ИИ (v2 уже содержит логику эскалации)
+                await event.respond(ai_response)
+                log_conversation(user_id, "bot_response", ai_response)
+                app_logger.info(f"Сообщение отправлено пользователю {user_id}")
                 
             except Exception as e:
                 app_logger.error(f"Ошибка обработки сообщения: {e}")
                 error_message = ("Извините, произошла техническая ошибка. "
                                "Попробуйте еще раз или обратитесь к нашему менеджеру.")
-                await telegram_client.send_message(user_id, error_message)
+                await event.respond(error_message)
+                log_conversation(user_id, "bot_response", error_message)
         
         app_logger.info("🎉 ИИ консультант запущен и готов к работе!")
         app_logger.info("Нажмите Ctrl+C для остановки")
