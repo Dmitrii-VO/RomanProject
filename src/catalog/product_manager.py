@@ -1,56 +1,178 @@
 """
-Менеджер каталога товаров с интеграцией МойСклад
+Менеджер каталога товаров с локальным индексом и fallback на МойСклад
 """
 import asyncio
+from datetime import datetime
 from typing import Dict, List, Optional, Any
 from src.integrations.moysklad_client import MoySkladClient
 from src.search.embeddings_manager import EmbeddingsManager
 from src.delivery.russian_post_client import RussianPostClient
 from src.payments.yukassa_client import YuKassaClient
+from .products_cache_manager import ProductsCacheManager
 from utils.logger import app_logger
 
 
 class ProductManager:
     """
-    Управляет каталогом товаров и поиском
+    Управляет каталогом товаров с быстрым локальным поиском
+    
+    Особенности v2:
+    - Локальный индекс товаров в SQLite
+    - Семантический поиск через embeddings
+    - Fallback на МойСклад API при сбоях
+    - Синхронизация каждые 12 часов
     """
     
     def __init__(self):
-        """Инициализация менеджера товаров"""
+        """Инициализация менеджера товаров v2"""
         self.moysklad = MoySkladClient()
         self.embeddings_manager = EmbeddingsManager()
         self.delivery_client = RussianPostClient()
         self.payment_client = YuKassaClient()
-        self._catalog_cache = {}  # Кэш каталога
-        self._cache_timestamp = None
-        self._cache_ttl = 3600  # TTL кэша в секундах (1 час)
+        self.cache_manager = ProductsCacheManager()
         
-        app_logger.info("ProductManager инициализирован")
+        # Флаги для отслеживания проблем
+        self.cache_failure_count = 0
+        self.max_cache_failures = 3
+        
+        app_logger.info("ProductManager v2 инициализирован с локальным индексом")
     
     async def search_products(self, query: str, budget_min: Optional[float] = None, 
-                            budget_max: Optional[float] = None, category: Optional[str] = None) -> List[Dict]:
+                            budget_max: Optional[float] = None, category: Optional[str] = None,
+                            max_results: int = 50) -> List[Dict]:
         """
-        Поиск товаров по параметрам
+        Быстрый поиск товаров с локальным индексом и fallback
         
         Args:
             query: Поисковый запрос
             budget_min: Минимальный бюджет
             budget_max: Максимальный бюджет
             category: Категория товаров
+            max_results: Максимальное количество результатов
             
         Returns:
             Список подходящих товаров
         """
+        start_time = datetime.now()
+        
         try:
+            # Сначала пробуем локальный кэш
+            if self.cache_manager.is_cache_fresh():
+                products = await self._search_in_local_cache(
+                    query, budget_min, budget_max, category, max_results
+                )
+                
+                if products:
+                    duration = (datetime.now() - start_time).total_seconds()
+                    app_logger.info(f"Найдено {len(products)} товаров в локальном кэше за {duration:.2f}s")
+                    self.cache_failure_count = 0  # Сбрасываем счетчик ошибок
+                    return products
+                else:
+                    app_logger.warning("Локальный кэш пуст, используем fallback")
+            else:
+                app_logger.warning("Локальный кэш устарел, используем fallback на МойСклад API")
+            
+            # Fallback на МойСклад API
+            products = await self._search_with_moysklad_fallback(
+                query, budget_min, budget_max, category, max_results
+            )
+            
+            duration = (datetime.now() - start_time).total_seconds()
+            app_logger.info(f"Fallback: найдено {len(products)} товаров за {duration:.2f}s")
+            
+            return products
+            
+        except Exception as e:
+            app_logger.error(f"Критическая ошибка поиска товаров: {e}")
+            self.cache_failure_count += 1
+            return []
+    
+    async def _search_in_local_cache(
+        self, 
+        query: str, 
+        budget_min: Optional[float], 
+        budget_max: Optional[float], 
+        category: Optional[str],
+        max_results: int
+    ) -> List[Dict]:
+        """Поиск товаров в локальном кэше"""
+        try:
+            # Базовый поиск в кэше (не фильтруем по остаткам, так как они не загружаются)
+            cached_products = await self.cache_manager.search_cached_products(
+                query=query,
+                category=category, 
+                price_min=budget_min,
+                price_max=budget_max,
+                in_stock_only=False,  # Отключаем фильтр по остаткам
+                limit=max_results * 2  # Берем больше для семантической фильтрации
+            )
+            
+            if not cached_products:
+                return []
+            
+            # Применяем семантический поиск для улучшения релевантности
+            if query and query.strip():
+                semantic_results = await self.embeddings_manager.semantic_search(
+                    query=query,
+                    limit=max_results,
+                    threshold=0.3
+                )
+                
+                if semantic_results:
+                    # Объединяем результаты по релевантности
+                    semantic_ids = {r['id'] for r in semantic_results}
+                    
+                    # Товары из семантического поиска (высокий приоритет)
+                    semantic_products = [
+                        p for p in cached_products 
+                        if p['id'] in semantic_ids
+                    ]
+                    
+                    # Товары только из текстового поиска (низкий приоритет)
+                    text_only_products = [
+                        p for p in cached_products 
+                        if p['id'] not in semantic_ids
+                    ]
+                    
+                    # Объединяем и ограничиваем результат
+                    combined_results = semantic_products + text_only_products
+                    return combined_results[:max_results]
+            
+            return cached_products[:max_results]
+            
+        except Exception as e:
+            app_logger.error(f"Ошибка поиска в локальном кэше: {e}")
+            return []
+    
+    async def _search_with_moysklad_fallback(
+        self,
+        query: str,
+        budget_min: Optional[float],
+        budget_max: Optional[float], 
+        category: Optional[str],
+        max_results: int
+    ) -> List[Dict]:
+        """Fallback поиск через МойСклад API с уведомлением о проблемах"""
+        try:
+            # Уведомляем о использовании fallback
+            if self.cache_failure_count >= self.max_cache_failures:
+                app_logger.warning(f"⚠️ Критично: {self.cache_failure_count} сбоев локального кэша подряд!")
+            
+            app_logger.info(f"🔄 Fallback: поиск товаров через МойСклад API (запрос: '{query}')")
+            
             # Если указана категория, ищем по категории
             if category:
-                products = await self.moysklad.search_products_by_category(category, limit=20)
+                products = await self.moysklad.search_products_by_category(category, limit=max_results)
             else:
-                # Иначе поиск по общему запросу
-                products = await self.moysklad.get_products(limit=50, search=query, 
-                                                          price_min=budget_min, price_max=budget_max)
+                # Иначе поиск по общему запросу  
+                products = await self.moysklad.get_products(
+                    limit=max_results,
+                    search=query,
+                    price_min=budget_min,
+                    price_max=budget_max
+                )
             
-            # Дополнительная фильтрация по бюджету если нужно
+            # Дополнительная фильтрация по бюджету
             if budget_min is not None or budget_max is not None:
                 filtered_products = []
                 for product in products:
@@ -62,15 +184,53 @@ class ProductManager:
                     filtered_products.append(product)
                 products = filtered_products
             
+            # Семантический поиск для улучшения релевантности (если доступен)
+            if query and query.strip() and len(products) > max_results:
+                try:
+                    semantic_results = await self.embeddings_manager.semantic_search(
+                        query=query,
+                        limit=max_results,
+                        threshold=0.2  # Более низкий порог для fallback
+                    )
+                    
+                    if semantic_results:
+                        semantic_ids = {r['id'] for r in semantic_results}
+                        # Приоритизируем семантически релевантные товары
+                        semantic_products = [p for p in products if p['id'] in semantic_ids]
+                        other_products = [p for p in products if p['id'] not in semantic_ids]
+                        products = semantic_products + other_products
+                        
+                except Exception as semantic_error:
+                    app_logger.warning(f"Семантический поиск недоступен в fallback: {semantic_error}")
+            
             # Сортируем по наличию и цене
             products.sort(key=lambda p: (-p.get('stock', 0), p.get('price', 0)))
             
-            app_logger.info(f"Найдено {len(products)} товаров по запросу: {query}")
-            return products
+            result = products[:max_results]
+            app_logger.info(f"Fallback API: найдено {len(result)} товаров")
+            
+            return result
             
         except Exception as e:
-            app_logger.error(f"Ошибка поиска товаров: {e}")
+            app_logger.error(f"Ошибка fallback поиска через МойСклад: {e}")
+            self.cache_failure_count += 1
             return []
+    
+    def should_use_fallback_notification(self) -> bool:
+        """Определяет, нужно ли показывать уведомление о проблемах с кэшем"""
+        return self.cache_failure_count >= self.max_cache_failures
+    
+    def get_search_status(self) -> Dict:
+        """Возвращает статус системы поиска товаров"""
+        cache_stats = self.cache_manager.get_cache_stats()
+        
+        return {
+            "cache_fresh": self.cache_manager.is_cache_fresh(),
+            "cache_failure_count": self.cache_failure_count,
+            "using_fallback": self.cache_failure_count > 0,
+            "fallback_critical": self.should_use_fallback_notification(),
+            "cache_stats": cache_stats
+        }
     
     async def get_product_recommendations(self, budget: float, category: str) -> List[Dict]:
         """

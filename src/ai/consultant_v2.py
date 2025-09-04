@@ -9,7 +9,9 @@ from .context_manager import DialogueContextManager
 from .prompts import get_enhanced_system_prompt
 from src.integrations.amocrm_client import AmoCRMClient
 from src.catalog.product_manager import ProductManager
+from src.catalog.sync_scheduler import ProductSyncScheduler
 from .order_automation_manager import OrderAutomationManager
+from src.rag.conversation_rag_manager import ConversationRAGManager
 
 
 class AmberAIConsultantV2:
@@ -36,16 +38,59 @@ class AmberAIConsultantV2:
         # AmoCRM клиент
         self.amocrm_client = AmoCRMClient()
         
-        # Менеджер каталога товаров
+        # Менеджер каталога товаров с локальным индексом
         self.product_manager = ProductManager()
+        
+        # Планировщик синхронизации товаров
+        self.sync_scheduler = ProductSyncScheduler()
         
         # Менеджер автоматизации заказов
         self.order_automation = OrderAutomationManager(self.product_manager)
         
+        # RAG система для переписок
+        self.rag_manager = ConversationRAGManager()
+        
         # Кэш активных сценариев заказов
         self.active_order_scenarios = {}
         
-        app_logger.info("ИИ консультант v2 с автоматизацией заказов инициализирован")
+        app_logger.info("ИИ консультант v2 с автоматизацией заказов и RAG инициализирован")
+    
+    async def start_sync_scheduler(self):
+        """Запускает планировщик синхронизации товаров и RAG систему"""
+        try:
+            await self.sync_scheduler.start(initial_sync=True)
+            app_logger.info("Планировщик синхронизации товаров запущен")
+            
+            await self.rag_manager.start_scheduler()
+            app_logger.info("RAG система запущена")
+        except Exception as e:
+            app_logger.error(f"Ошибка запуска планировщиков: {e}")
+    
+    async def stop_sync_scheduler(self):
+        """Останавливает планировщик синхронизации товаров и RAG систему"""
+        try:
+            await self.sync_scheduler.stop()
+            app_logger.info("Планировщик синхронизации товаров остановлен")
+            
+            await self.rag_manager.stop_scheduler()
+            app_logger.info("RAG система остановлена")
+        except Exception as e:
+            app_logger.error(f"Ошибка остановки планировщиков: {e}")
+    
+    def get_system_status(self) -> Dict:
+        """Получает статус всех систем консультанта"""
+        search_status = self.product_manager.get_search_status()
+        scheduler_status = self.sync_scheduler.get_status()
+        rag_status = self.rag_manager.get_system_status()
+        
+        return {
+            "consultant_version": "v2_with_rag_and_cache",
+            "search_system": search_status,
+            "sync_scheduler": scheduler_status,
+            "rag_system": rag_status,
+            "active_scenarios": len(self.active_order_scenarios),
+            "fallback_warning": search_status.get("fallback_critical", False)
+        }
     
     async def process_message(self, user_id: int, user_message: str) -> str:
         """
@@ -240,14 +285,32 @@ class AmberAIConsultantV2:
         return data
     
     async def _process_standard_message(self, user_id: int, user_message: str) -> str:
-        """Стандартная обработка сообщения через ИИ"""
+        """Стандартная обработка сообщения через ИИ с RAG"""
         # Проверяем первое ли это взаимодействие
         is_first_interaction = self.context_manager.is_first_interaction(user_id)
         
         # При первом взаимодействии создаем контакт и сделку в AmoCRM
+        deal_id = None
         if is_first_interaction:
-            await self.amocrm_client.get_or_create_contact_and_lead(user_id)
+            contact_id, lead_id = await self.amocrm_client.get_or_create_contact_and_lead(user_id)
+            deal_id = lead_id
             app_logger.info(f"Создан контакт и сделка в AmoCRM для пользователя {user_id}")
+        
+        # Индексируем сообщение пользователя в RAG (асинхронно)
+        await self.rag_manager.index_message(
+            customer_id=str(user_id),
+            sender_type="customer",
+            content=user_message,
+            deal_id=str(deal_id) if deal_id else None
+        )
+        
+        # Получаем релевантный контекст из RAG
+        rag_context = await self.rag_manager.get_relevant_context(
+            query=user_message,
+            customer_id=str(user_id),
+            deal_id=str(deal_id) if deal_id else None,
+            context_type="general"
+        )
         
         # Добавляем сообщение пользователя в контекст
         self.context_manager.add_message(user_id, user_message, is_bot=False)
@@ -255,10 +318,11 @@ class AmberAIConsultantV2:
         # Получаем контекст диалога
         context_history = self.context_manager.get_context(user_id)
         
-        # Формируем расширенный системный промпт
+        # Формируем расширенный системный промпт с RAG контекстом
         enhanced_system_prompt = get_enhanced_system_prompt(
             context_history=context_history,
-            is_first_interaction=is_first_interaction
+            is_first_interaction=is_first_interaction,
+            rag_context=rag_context.get('context_summary', '')
         )
         
         # Запрос к OpenAI
@@ -280,6 +344,14 @@ class AmberAIConsultantV2:
         
         # Добавляем ответ ИИ в контекст
         self.context_manager.add_message(user_id, ai_response, is_bot=True)
+        
+        # Индексируем ответ бота в RAG (асинхронно)
+        await self.rag_manager.index_message(
+            customer_id=str(user_id),
+            sender_type="bot",
+            content=ai_response,
+            deal_id=str(deal_id) if deal_id else None
+        )
         
         # Дополнительные обработчики (товары, доставка)
         additional_content = []

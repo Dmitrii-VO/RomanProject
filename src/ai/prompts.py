@@ -54,21 +54,26 @@ CONTINUE_CONVERSATION_INSTRUCTIONS = """
 Диалог уже идет — НЕ здоровайся повторно, продолжай разговор естественно на основе контекста."""
 
 
-def get_enhanced_system_prompt(context_history: str = "", is_first_interaction: bool = True) -> str:
+def get_enhanced_system_prompt(context_history: str = "", is_first_interaction: bool = True, rag_context: str = "") -> str:
     """
-    Формирует расширенный системный промпт с контекстом диалога
+    Формирует расширенный системный промпт с контекстом диалога и RAG
     
     Args:
         context_history: История диалога
         is_first_interaction: Первое ли это взаимодействие с клиентом
+        rag_context: Релевантный контекст из переписок (RAG)
         
     Returns:
         Расширенный системный промпт
     """
     enhanced_prompt = AMBER_CONSULTANT_SYSTEM_PROMPT
     
+    # Добавляем RAG контекст если есть
+    if rag_context and rag_context.strip():
+        enhanced_prompt += f"\n\nРЕЛЕВАНТНЫЙ КОНТЕКСТ ИЗ ПРЕДЫДУЩИХ ПЕРЕПИСОК:\n{rag_context}\n\nИспользуй эту информацию для более персонализированного ответа, учитывая предыдущие интересы и вопросы клиента."
+    
     if context_history:
-        enhanced_prompt += f"\n\nКОНТЕКСТ ДИАЛОГА:\n{context_history}"
+        enhanced_prompt += f"\n\nТЕКУЩИЙ КОНТЕКСТ ДИАЛОГА:\n{context_history}"
     
     if is_first_interaction:
         enhanced_prompt += GREETING_INSTRUCTIONS

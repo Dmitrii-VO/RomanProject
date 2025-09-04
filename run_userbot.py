@@ -38,6 +38,9 @@ class AmberUserBot:
             me = await self.client.get_me()
             app_logger.info(f"✅ Подключен как: @{me.username} (ID: {me.id})")
             
+            # Запускаем планировщик синхронизации товаров
+            await self.ai_consultant.start_sync_scheduler()
+            
             # Добавляем обработчик входящих сообщений
             @self.client.on(events.NewMessage(incoming=True))
             async def handle_message(event):
@@ -78,8 +81,8 @@ class AmberUserBot:
             # Обработка через ИИ консультант v2
             ai_response = await self.ai_consultant.process_message(user_id, message_text)
             
-            # Отправляем ответ
-            await event.reply(ai_response)
+            # Отправляем ответ (не reply, а обычное сообщение в чат)
+            await self.client.send_message(event.chat_id, ai_response)
             
             # Логируем ответ
             app_logger.info(f"📤 Отправлен ответ пользователю {user_id}")
@@ -89,7 +92,7 @@ class AmberUserBot:
             app_logger.error(f"Ошибка обработки сообщения: {e}")
             try:
                 error_response = "Извините, произошла техническая ошибка. Попробуйте еще раз!"
-                await event.reply(error_response)
+                await self.client.send_message(event.chat_id, error_response)
                 log_conversation(user_id, "bot_response", error_response)
             except:
                 pass  # Если не можем отправить даже error message
@@ -97,6 +100,9 @@ class AmberUserBot:
     async def stop(self):
         """Остановка userbot"""
         try:
+            # Останавливаем планировщик синхронизации
+            await self.ai_consultant.stop_sync_scheduler()
+            
             await self.client.disconnect()
             app_logger.info("👋 UserBot остановлен")
         except:

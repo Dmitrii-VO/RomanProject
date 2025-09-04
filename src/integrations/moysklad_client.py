@@ -5,7 +5,11 @@ import os
 import base64
 from typing import Dict, List, Optional, Any
 import aiohttp
+from dotenv import load_dotenv
 from utils.logger import app_logger
+
+# Загружаем переменные окружения
+load_dotenv()
 
 
 class MoySkladClient:
