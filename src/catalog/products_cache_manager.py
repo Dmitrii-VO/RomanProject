@@ -395,12 +395,8 @@ class ProductsCacheManager:
             sql_parts = ["SELECT * FROM cached_products WHERE 1=1"]
             params = []
             
-            # Фильтр по тексту (регистронезависимый поиск с нормализацией)
-            if query:
-                normalized_query = self._normalize_search_query(query)
-                sql_parts.append("AND (LOWER(name) LIKE LOWER(?) OR LOWER(description) LIKE LOWER(?))")
-                like_query = f"%{normalized_query}%"
-                params.extend([like_query, like_query])
+            # Фильтр по тексту (поиск без SQLite LOWER для кириллицы)
+            text_filter_needed = bool(query)
             
             # Фильтр по категории
             if category:
@@ -420,9 +416,8 @@ class ProductsCacheManager:
             if in_stock_only:
                 sql_parts.append("AND stock > 0")
             
-            # Сортировка и лимит
-            sql_parts.append("ORDER BY last_updated DESC LIMIT ?")
-            params.append(limit)
+            # Сортировка (лимит применяем в Python после фильтрации по тексту)
+            sql_parts.append("ORDER BY last_updated DESC")
             
             sql_query = " ".join(sql_parts)
             
@@ -432,7 +427,7 @@ class ProductsCacheManager:
                 products = []
                 for row in cursor.fetchall():
                     images = json.loads(row[9]) if row[9] else []
-                    products.append({
+                    product = {
                         'id': row[0],
                         'name': row[1],
                         'description': row[2],
@@ -444,7 +439,29 @@ class ProductsCacheManager:
                         'volume': row[8],
                         'images': images,
                         'last_updated': row[10]
-                    })
+                    }
+                    
+                    # Фильтрация по тексту в Python (для корректной работы с кириллицей)
+                    if text_filter_needed:
+                        normalized_query = self._normalize_search_query(query).lower()
+                        product_name = product['name'].lower()
+                        product_desc = (product['description'] or '').lower()
+                        
+                        # Проверяем содержат ли товары релевантные термины
+                        # Если запрос общий (покажите, фотографии и т.д.) - не фильтруем
+                        general_terms = ['покажите', 'фотографии', 'фото', 'картинки', 'изображения', 
+                                       'варианты', 'примеры', 'что есть', 'ассортимент', 'товары']
+                        
+                        is_general_query = any(term in normalized_query for term in general_terms)
+                        
+                        if not is_general_query and normalized_query not in product_name and normalized_query not in product_desc:
+                            continue
+                    
+                    products.append(product)
+                
+                # Ограничиваем результат
+                if limit and len(products) > limit:
+                    products = products[:limit]
                 
                 app_logger.info(f"Найдено {len(products)} товаров в локальном кэше")
                 return products

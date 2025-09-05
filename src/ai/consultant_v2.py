@@ -1,5 +1,5 @@
 """
-ИИ консультант v2 с полной автоматизацией заказов
+ИИ консультант v2 с полной автоматизацией заказов и поведенческой моделью
 """
 import os
 import openai
@@ -13,6 +13,13 @@ from src.catalog.sync_scheduler import ProductSyncScheduler
 from .order_automation_manager import OrderAutomationManager
 from src.rag.conversation_rag_manager import ConversationRAGManager
 
+# Новые компоненты поведенческой модели
+from .intent_classifier import IntentClassifier
+from .entity_extractor import EntityExtractor
+from .dialogue_state_manager import DialogueStateManager
+from .delivery_manager import DeliveryManager
+from .guardrails import ConsultantGuardrails, SelfAssessment
+
 
 class AmberAIConsultantV2:
     """
@@ -20,7 +27,7 @@ class AmberAIConsultantV2:
     """
     
     def __init__(self):
-        """Инициализация ИИ консультанта v2"""
+        """Инициализация ИИ консультанта v2 с поведенческой моделью"""
         self.client = openai.OpenAI(
             api_key=os.getenv("OPENAI_API_KEY"),
             base_url=os.getenv("OpenAI_BASE_URL")
@@ -50,10 +57,18 @@ class AmberAIConsultantV2:
         # RAG система для переписок
         self.rag_manager = ConversationRAGManager()
         
+        # Компоненты поведенческой модели
+        self.intent_classifier = IntentClassifier()
+        self.entity_extractor = EntityExtractor()
+        self.dialogue_state_manager = DialogueStateManager()
+        self.delivery_manager = DeliveryManager()
+        self.guardrails = ConsultantGuardrails()
+        self.self_assessment = SelfAssessment()
+        
         # Кэш активных сценариев заказов
         self.active_order_scenarios = {}
         
-        app_logger.info("ИИ консультант v2 с автоматизацией заказов и RAG инициализирован")
+        app_logger.info("ИИ консультант v2 с поведенческой моделью инициализирован")
     
     async def start_sync_scheduler(self):
         """Запускает планировщик синхронизации товаров и RAG систему"""
@@ -94,7 +109,7 @@ class AmberAIConsultantV2:
     
     async def process_message(self, user_id: int, user_message: str) -> str:
         """
-        Обработка сообщения пользователя с полным сценарием автоматизации
+        Обработка сообщения пользователя с поведенческой моделью и полным сценарием автоматизации
         
         Args:
             user_id: ID пользователя
@@ -104,20 +119,61 @@ class AmberAIConsultantV2:
             Ответ ИИ консультанта
         """
         try:
-            # Проверяем, есть ли активный сценарий заказа
-            if user_id in self.active_order_scenarios:
+            # === Этап 1: Анализ входящего сообщения ===
+            # Классификация намерения
+            intent, intent_confidence = self.intent_classifier.classify_intent(user_message)
+            app_logger.info(f"Классифицированное намерение: {intent} (уверенность: {intent_confidence:.2f})")
+            
+            # Извлечение сущностей
+            entities = self.entity_extractor.extract_entities(user_message)
+            app_logger.info(f"Извлеченные сущности: {entities}")
+            
+            # === Этап 2: Управление состоянием диалога ===
+            # Получаем или создаем состояние диалога
+            if user_id not in self.active_order_scenarios:
+                # Инициализируем новое состояние диалога
+                dialogue_state = self.dialogue_state_manager.initialize_dialogue(user_id, intent, entities)
+            else:
+                # Обновляем существующее состояние
+                dialogue_state = self.active_order_scenarios[user_id].get("dialogue_state", {})
+                dialogue_state = self.dialogue_state_manager.update_state(dialogue_state, intent, entities, user_message)
+            
+            # === Этап 3: Определение следующих действий ===
+            # Проверяем, нужно ли передать менеджеру
+            if self.dialogue_state_manager.should_escalate_to_manager(dialogue_state):
+                return await self._handle_escalation_to_manager(user_id, dialogue_state, user_message)
+            
+            # Проверяем старый механизм активных сценариев заказов (только если уже начат процесс заказа)
+            if user_id in self.active_order_scenarios and "next_action" in self.active_order_scenarios[user_id]:
                 return await self._handle_active_order_scenario(user_id, user_message)
             
-            # Проверяем намерение оформить заказ
-            order_intent = self.order_automation.detect_order_intent(user_message)
-            if order_intent.get("has_intent"):
-                return await self._start_order_automation(user_id, order_intent, user_message)
-            
-            # Стандартная обработка ИИ консультанта
-            return await self._process_standard_message(user_id, user_message)
+            # === ПРИОРИТЕТ: Поведенческая модель обрабатывает намерения ПЕРВОЙ ===
+            # Обрабатываем по типу намерения
+            if intent == "buy":
+                # Для намерения покупки - сначала показываем товары, потом предлагаем заказ
+                return await self._handle_purchase_intent(user_id, dialogue_state, user_message, entities)
+            elif intent == "browse_catalog":
+                return await self._handle_catalog_browsing(user_id, dialogue_state, user_message, entities)
+            elif intent == "delivery":
+                return await self._handle_delivery_inquiry(user_id, dialogue_state, user_message, entities)
+            elif intent == "handover_request":
+                return await self._handle_escalation_to_manager(user_id, dialogue_state, user_message)
+            elif intent == "product_question" and dialogue_state.get("current_stage") in ["selection", "ordering"]:
+                return await self._handle_purchase_intent(user_id, dialogue_state, user_message, entities)
+            else:
+                # === FALLBACK: Старая логика только если поведенческая модель не обработала ===
+                
+                # Проверяем намерение оформить заказ (только если поведенческая модель не сработала)
+                order_intent = self.order_automation.detect_order_intent(user_message)
+                if order_intent.get("has_intent"):
+                    app_logger.info("Поведенческая модель не обработала, используем старую автоматизацию заказов")
+                    return await self._start_order_automation(user_id, order_intent, user_message)
+                
+                # Стандартная обработка для остальных интентов
+                return await self._process_standard_message_with_behavior(user_id, user_message, intent, entities, dialogue_state)
             
         except Exception as e:
-            app_logger.error(f"Ошибка обработки сообщения ИИ v2: {e}")
+            app_logger.error(f"Ошибка обработки сообщения с поведенческой моделью: {e}")
             return "Извините, произошла техническая ошибка. Пожалуйста, попробуйте еще раз или обратитесь к нашему менеджеру."
     
     async def _handle_active_order_scenario(self, user_id: int, user_message: str) -> str:
@@ -284,6 +340,185 @@ class AmberAIConsultantV2:
         
         return data
     
+    async def _handle_purchase_intent(self, user_id: int, dialogue_state: Dict, user_message: str, entities: Dict) -> str:
+        """Обработка намерения покупки с поведенческой моделью"""
+        try:
+            # Проверяем, достаточно ли данных для поиска товаров
+            missing_slots = self.dialogue_state_manager.get_missing_slots_for_search(dialogue_state)
+            
+            if missing_slots:
+                # Генерируем вопрос для сбора недостающих данных
+                question = self._generate_slot_collection_question(missing_slots[0], dialogue_state)
+                # Обновляем состояние диалога
+                dialogue_state["current_stage"] = "slot_filling"
+                dialogue_state["awaiting_slot"] = missing_slots[0]
+                self.active_order_scenarios[user_id] = {"dialogue_state": dialogue_state}
+                return question
+            
+            # Если данных достаточно - ищем товары
+            search_params = self._build_search_params_from_entities(entities, dialogue_state)
+            all_products = await self.product_manager.search_products(query=user_message, **search_params)
+            
+            # Фильтруем только товары в наличии
+            products = self._filter_products_in_stock(all_products)
+            
+            if products:
+                dialogue_state["current_stage"] = "selection"
+                dialogue_state["found_products"] = products[:5]  # Ограничиваем до 5 товаров
+                self.active_order_scenarios[user_id] = {"dialogue_state": dialogue_state}
+                
+                products_text = self.product_manager.format_products_list(products, max_products=5)
+                return f"🛍️ **Подобрал товары по вашим критериям (в наличии):**\n\n{products_text}\n\nКакой товар вас заинтересовал?"
+            else:
+                # Если в наличии нет товаров, предлагаем связаться с менеджером
+                out_of_stock_count = len(all_products) - len(products)
+                if out_of_stock_count > 0:
+                    return f"😔 К сожалению, товары по вашим критериям сейчас не в наличии (найдено {out_of_stock_count} товаров, но они закончились). Свяжитесь с нашим менеджером - возможно, товары поступят в ближайшее время!"
+                else:
+                    return "😔 К сожалению, товары по вашим критериям не найдены. Попробуйте изменить запрос или свяжитесь с нашим менеджером."
+                
+        except Exception as e:
+            app_logger.error(f"Ошибка обработки намерения покупки: {e}")
+            return "Произошла ошибка при поиске товаров. Попробуйте еще раз!"
+    
+    async def _handle_catalog_browsing(self, user_id: int, dialogue_state: Dict, user_message: str, entities: Dict) -> str:
+        """Обработка просмотра каталога"""
+        try:
+            # Поиск товаров для просмотра
+            search_params = self._build_search_params_from_entities(entities, dialogue_state)
+            all_products = await self.product_manager.search_products(query=user_message, **search_params)
+            
+            # Фильтруем только товары в наличии
+            products = self._filter_products_in_stock(all_products)
+            
+            if products:
+                products_text = self.product_manager.format_products_list(products, max_products=3)
+                return f"🛍️ **Товары из нашего каталога (в наличии):**\n\n{products_text}"
+            else:
+                out_of_stock_count = len(all_products) - len(products)
+                if out_of_stock_count > 0:
+                    return f"😔 К сожалению, товары по вашим критериям сейчас не в наличии (найдено {out_of_stock_count} товаров, но они закончились)."
+                else:
+                    return "😔 К сожалению, товары по вашим критериям не найдены."
+                
+        except Exception as e:
+            app_logger.error(f"Ошибка просмотра каталога: {e}")
+            return None
+    
+    async def _handle_delivery_inquiry(self, user_id: int, dialogue_state: Dict, user_message: str, entities: Dict) -> str:
+        """Обработка вопросов о доставке с использованием DeliveryManager"""
+        try:
+            # Извлекаем информацию о заказе из состояния диалога
+            order_total = dialogue_state.get("order_total", 0)
+            city = entities.get("city") or dialogue_state.get("city")
+            postcode = entities.get("postcode") or dialogue_state.get("postcode")
+            
+            if order_total > 0:
+                # Есть информация о заказе - рассчитываем точную стоимость доставки
+                delivery_info = self.delivery_manager.calculate_delivery_cost(order_total, city)
+                return f"📦 **Информация о доставке:**\n\n{delivery_info['message']}"
+            else:
+                # Общая информация о доставке
+                return self.delivery_manager.get_delivery_info()
+                
+        except Exception as e:
+            app_logger.error(f"Ошибка обработки запроса доставки: {e}")
+            return self.delivery_manager.get_delivery_info()
+    
+    async def _handle_escalation_to_manager(self, user_id: int, dialogue_state: Dict, user_message: str) -> str:
+        """Обработка передачи менеджеру"""
+        # Сохраняем контекст для менеджера
+        dialogue_state["escalated_to_manager"] = True
+        dialogue_state["escalation_reason"] = user_message
+        self.active_order_scenarios[user_id] = {"dialogue_state": dialogue_state}
+        
+        return """👨‍💼 **Передаю вас менеджеру**
+        
+Ваш запрос передан нашему менеджеру. Он свяжется с вами в ближайшее время для персональной консультации.
+        
+⏰ Время работы менеджера: Пн-Пт 9:00-18:00
+📱 Контакты: +7 (XXX) XXX-XX-XX"""
+    
+    def _generate_slot_collection_question(self, slot_name: str, dialogue_state: Dict) -> str:
+        """Генерирует вопрос для сбора недостающих данных"""
+        questions = {
+            "category": "Какой тип украшения вас интересует? (кольцо, серьги, кулон, браслет, колье)",
+            "budget": "Какой у вас бюджет на покупку?",
+            "style": "Какой стиль вам больше нравится? (классический, современный, винтажный)",
+            "city": "В какой город нужна доставка?",
+            "postcode": "Укажите почтовый индекс для точного расчета доставки",
+            "name": "Как к вам обращаться?",
+            "phone": "Укажите ваш номер телефона для связи"
+        }
+        return questions.get(slot_name, "Уточните, пожалуйста, дополнительную информацию")
+    
+    def _build_search_params_from_entities(self, entities: Dict, dialogue_state: Dict) -> Dict:
+        """Строит параметры поиска на основе извлеченных сущностей"""
+        search_params = {}
+        
+        # Используем сущности из текущего сообщения и состояния диалога
+        all_entities = {**dialogue_state.get("entities", {}), **entities}
+        
+        if all_entities.get("category"):
+            search_params["category"] = all_entities["category"]
+        if all_entities.get("budget"):
+            budget_info = all_entities["budget"]
+            if isinstance(budget_info, dict):
+                if "value" in budget_info:
+                    # Если указана конкретная сумма
+                    search_params["max_price"] = budget_info["value"]
+                elif "max" in budget_info:
+                    search_params["max_price"] = budget_info["max"]
+                if "min" in budget_info:
+                    search_params["min_price"] = budget_info["min"]
+        
+        return search_params
+    
+    def _filter_products_in_stock(self, products: List[Dict]) -> List[Dict]:
+        """Фильтрует товары, оставляя только те, что в наличии"""
+        if not products:
+            return []
+        
+        in_stock_products = []
+        for product in products:
+            # Проверяем наличие товара по полям quantity, stock или in_stock
+            quantity = product.get('quantity', 0)
+            stock = product.get('stock', 0)
+            in_stock = product.get('in_stock', True)  # По умолчанию считаем что в наличии
+            
+            # Товар в наличии если:
+            # 1. quantity > 0, или
+            # 2. stock > 0, или  
+            # 3. in_stock = True и нет информации о количестве
+            if (quantity and quantity > 0) or (stock and stock > 0) or (in_stock and not quantity and not stock):
+                in_stock_products.append(product)
+        
+        app_logger.info(f"Отфильтровано товаров в наличии: {len(in_stock_products)} из {len(products)}")
+        return in_stock_products
+    
+    async def _process_standard_message_with_behavior(self, user_id: int, user_message: str, intent: str, entities: Dict, dialogue_state: Dict) -> str:
+        """Стандартная обработка сообщения с поведенческой моделью"""
+        # Сохраняем состояние диалога
+        if dialogue_state:
+            self.active_order_scenarios[user_id] = {"dialogue_state": dialogue_state}
+        
+        # Вызываем стандартную обработку
+        response = await self._process_standard_message(user_id, user_message)
+        
+        # Применяем гарантии качества
+        quality_check_results = self.guardrails.check_response(response, {"user_message": user_message})
+        critical_issues = [r for r in quality_check_results if r.severity == "critical" and not r.passed]
+        if critical_issues:
+            app_logger.warning(f"Обнаружены критические проблемы качества: {[issue.message for issue in critical_issues]}")
+            # При критических проблемах переписываем ответ
+            response = "Извините, я не могу предоставить точную информацию по вашему вопросу. Обратитесь к нашему менеджеру для получения подробной консультации."
+        
+        # Самооценка качества ответа
+        assessment = self.self_assessment.assess_response(user_message, response, intent, entities)
+        app_logger.info(f"Оценка качества ответа: {assessment['overall_score']:.2f}")
+        
+        return response
+    
     async def _process_standard_message(self, user_id: int, user_message: str) -> str:
         """Стандартная обработка сообщения через ИИ с RAG"""
         # Проверяем первое ли это взаимодействие
@@ -413,7 +648,7 @@ class AmberAIConsultantV2:
             return None
     
     async def _handle_delivery_requests(self, user_id: int, user_message: str, ai_response: str) -> Optional[str]:
-        """Обрабатывает запросы о доставке"""
+        """Обрабатывает запросы о доставке с использованием DeliveryManager"""
         try:
             delivery_triggers = [
                 'доставка', 'доставить', 'отправка', 'почта', 'курьер',
@@ -426,16 +661,26 @@ class AmberAIConsultantV2:
             if not should_handle_delivery:
                 return None
             
-            # Простая информация о доставке
-            return """📦 **Доставка Почтой России:**
-
-🎁 **Бесплатная доставка** от 15,000₽
-💰 До 15,000₽ — по тарифам Почты России (оплата при получении)
-⏰ Сроки: 3-7 рабочих дней
-📍 Доставляем по всей России
-
-Для точного расчета укажите ваш почтовый индекс!"""
+            # Извлекаем сущности для более точного расчета доставки
+            entities = self.entity_extractor.extract_entities(user_message)
+            
+            # Получаем информацию о заказе из состояния диалога, если есть
+            order_total = 0
+            if user_id in self.active_order_scenarios:
+                dialogue_state = self.active_order_scenarios[user_id].get("dialogue_state", {})
+                order_total = dialogue_state.get("order_total", 0)
+            
+            city = entities.get("city")
+            postcode = entities.get("postcode")
+            
+            if order_total > 0:
+                # Есть информация о заказе - рассчитываем точную стоимость доставки
+                delivery_info = self.delivery_manager.calculate_delivery_cost(order_total, city)
+                return f"📦 **Информация о доставке для вашего заказа:**\n\n{delivery_info['message']}"
+            else:
+                # Общая информация о доставке
+                return f"📦 **Информация о доставке:**\n\n{self.delivery_manager.get_delivery_info()}"
                 
         except Exception as e:
             app_logger.error(f"Ошибка обработки запроса доставки: {e}")
-            return None
+            return f"📦 **Информация о доставке:**\n\n{self.delivery_manager.get_delivery_info()}"
